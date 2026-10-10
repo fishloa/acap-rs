@@ -212,6 +212,7 @@ pub struct StreamBuilder {
     resolution: Resolution,
     framerate: u32,
     gop_length: u32,
+    settings: Option<Map>,
 }
 
 impl Default for StreamBuilder {
@@ -223,6 +224,7 @@ impl Default for StreamBuilder {
             resolution: Resolution::Native,
             framerate: 0,
             gop_length: 0,
+            settings: None,
         }
     }
 }
@@ -230,6 +232,39 @@ impl Default for StreamBuilder {
 impl StreamBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A builder that passes exactly `settings` to `vdo_stream_new`; the
+    /// other builder methods have no effect on it.
+    ///
+    /// Use this to join an encode that is already running: when `settings`
+    /// is an exact copy of a stream whose `sharable` setting is true (from
+    /// [`list_streams()`], with the `id`, `identity` and `intent` entries
+    /// removed), VDO gives the new stream the *same* encode instead of
+    /// starting another, and [`Stream::id()`] returns the existing stream's
+    /// id. The copy must be exact, buffer settings included; any difference
+    /// starts a new encode. A joined stream may be non-blocking
+    /// (`socket.blocking` false), which [`RunningStream::next_buffer()`]
+    /// handles.
+    ///
+    /// ```no_run
+    /// let existing = vdo::list_streams()?
+    ///     .into_iter()
+    ///     .find(|s| s.settings.get_bool(c"sharable", false))
+    ///     .expect("a sharable stream");
+    /// let mut settings = existing.settings.clone();
+    /// for key in [c"id", c"identity", c"intent"] {
+    ///     settings.remove(key);
+    /// }
+    /// let stream = vdo::StreamBuilder::from_settings(settings).build()?;
+    /// assert_eq!(stream.id(), existing.id);
+    /// # Ok::<(), vdo::Error>(())
+    /// ```
+    pub fn from_settings(settings: Map) -> Self {
+        Self {
+            settings: Some(settings),
+            ..Self::default()
+        }
     }
 
     /// Default: `VdoFormat::VDO_FORMAT_H264`
@@ -281,6 +316,9 @@ impl StreamBuilder {
     /// Returns an error if the stream could not be created (e.g., invalid format
     /// for the platform, or camera not available).
     pub fn build(self) -> std::result::Result<Stream, Error> {
+        if let Some(map) = self.settings {
+            return Stream::from_settings(&map);
+        }
         let mut map = Map::new();
         map.set_u32(c"channel", self.channel);
         map.set_u32(c"format", self.format.0 as u32);
@@ -302,23 +340,50 @@ impl StreamBuilder {
             VdoBufferStrategy::VDO_BUFFER_STRATEGY_INFINITE.0,
         );
 
-        let (stream_raw, maybe_error) =
-            unsafe { try_func!(vdo_sys::vdo_stream_new, map.as_ptr(), None) };
-
-        if stream_raw.is_null() {
-            return Err(maybe_error.unwrap_or(Error::MissingVdoError));
-        }
-
-        debug_assert!(
-            maybe_error.is_none(),
-            "vdo_stream_new returned a stream pointer AND an error"
-        );
-
-        Ok(Stream {
-            raw: stream_raw,
-            started: false,
-        })
+        Stream::from_settings(&map)
     }
+}
+
+/// An existing VDO stream, from [`list_streams()`].
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    /// The stream's id, as [`Stream::id()`] reports it.
+    pub id: u32,
+    /// The stream's settings (`vdo_stream_get_settings`).
+    pub settings: Map,
+}
+
+/// Every stream VDO currently has, from any client, with its settings.
+/// Streams whose settings can't be read are left out.
+pub fn list_streams() -> std::result::Result<Vec<StreamInfo>, Error> {
+    let mut error: *mut GError = ptr::null_mut();
+    let list = unsafe { vdo_sys::vdo_stream_get_all(&mut error) };
+    if !error.is_null() {
+        return Err(Error::Vdo(VdoError::from_gerror(error)));
+    }
+    let mut streams = Vec::new();
+    let mut node = list;
+    while !node.is_null() {
+        // SAFETY: node is a live element of the list VDO returned; its data
+        // is a VdoStream we own a reference to and release below.
+        let raw = unsafe { (*node).data } as *mut VdoStream;
+        if !raw.is_null() {
+            let id = unsafe { vdo_sys::vdo_stream_get_id(raw) };
+            let (map_raw, maybe_error) =
+                unsafe { try_func!(vdo_sys::vdo_stream_get_settings, raw) };
+            if !map_raw.is_null() {
+                // SAFETY: non-null and owned by us, per vdo_stream_get_settings.
+                let settings = unsafe { Map::from_raw(map_raw) };
+                streams.push(StreamInfo { id, settings });
+            } else {
+                log::debug!("skipping VDO stream {id}: settings unreadable: {maybe_error:?}");
+            }
+            unsafe { g_object_unref(raw as *mut GObject) };
+        }
+        node = unsafe { (*node).next };
+    }
+    unsafe { glib_sys::g_list_free(list) };
+    Ok(streams)
 }
 
 /// A video stream from a camera channel.
@@ -359,6 +424,31 @@ impl Stream {
     /// Equivalent to `StreamBuilder::new().build()` (H.264 format, native resolution).
     pub fn new() -> std::result::Result<Self, Error> {
         StreamBuilder::new().build()
+    }
+
+    fn from_settings(map: &Map) -> std::result::Result<Self, Error> {
+        let (stream_raw, maybe_error) =
+            unsafe { try_func!(vdo_sys::vdo_stream_new, map.as_ptr(), None) };
+
+        if stream_raw.is_null() {
+            return Err(maybe_error.unwrap_or(Error::MissingVdoError));
+        }
+
+        debug_assert!(
+            maybe_error.is_none(),
+            "vdo_stream_new returned a stream pointer AND an error"
+        );
+
+        Ok(Stream {
+            raw: stream_raw,
+            started: false,
+        })
+    }
+
+    /// The stream's VDO id. For a stream that joined an existing encode (see
+    /// [`StreamBuilder::from_settings()`]) this is the existing stream's id.
+    pub fn id(&self) -> u32 {
+        unsafe { vdo_sys::vdo_stream_get_id(self.raw) }
     }
 
     /// Returns stream information (actual resolution, format, etc.) as a map.
@@ -419,18 +509,51 @@ unsafe impl Send for RunningStream {}
 
 impl RunningStream {
     /// Blocks until a new frame is available and returns it.
+    ///
+    /// A stream that joined an existing encode can be non-blocking, where
+    /// VDO reports `VDO_ERROR_NO_DATA` until a frame is ready; this waits on
+    /// the stream's file descriptor and retries, so it blocks either way.
     pub fn next_buffer(&self) -> std::result::Result<StreamBuffer<'_>, Error> {
-        let (buffer_ptr, maybe_error) =
-            unsafe { try_func!(vdo_sys::vdo_stream_get_buffer, self.stream.raw) };
-
-        if buffer_ptr.is_null() {
-            return Err(maybe_error.unwrap_or(Error::MissingVdoError));
-        }
+        let buffer_ptr = loop {
+            let (buffer_ptr, maybe_error) =
+                unsafe { try_func!(vdo_sys::vdo_stream_get_buffer, self.stream.raw) };
+            if !buffer_ptr.is_null() {
+                break buffer_ptr;
+            }
+            match maybe_error {
+                Some(Error::Vdo(e)) if e.code() == vdo_sys::VDO_ERROR_NO_DATA.0 as i32 => {
+                    self.wait_readable()?
+                }
+                other => return Err(other.unwrap_or(Error::MissingVdoError)),
+            }
+        };
 
         Ok(StreamBuffer {
             raw: buffer_ptr,
             stream: &self.stream,
         })
+    }
+
+    /// The stream's VDO id; see [`Stream::id()`].
+    pub fn id(&self) -> u32 {
+        self.stream.id()
+    }
+
+    /// Blocks until the stream's file descriptor is readable.
+    fn wait_readable(&self) -> std::result::Result<(), Error> {
+        let (fd, maybe_error) = unsafe { try_func!(vdo_sys::vdo_stream_get_fd, self.stream.raw) };
+        if fd < 0 {
+            return Err(maybe_error.unwrap_or(Error::MissingVdoError));
+        }
+        let mut pfd = glib_sys::GPollFD {
+            fd,
+            events: glib_sys::G_IO_IN as u16,
+            revents: 0,
+        };
+        // A bounded wait, so a stream that has stopped producing returns to
+        // vdo_stream_get_buffer (and its error) instead of hanging here.
+        unsafe { glib_sys::g_poll(&mut pfd, 1, 1000) };
+        Ok(())
     }
 
     /// Asks the encoder to insert a key frame into the stream.
