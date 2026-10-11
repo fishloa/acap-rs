@@ -408,7 +408,8 @@ impl Stream {
     /// removed), VDO gives the new stream the *same* encode instead of
     /// starting another, and [`Stream::id()`] returns the existing stream's
     /// id. The copy must be exact, buffer settings included; any difference
-    /// starts a new encode. A joined stream may be non-blocking
+    /// starts a new encode. Because the buffer strategy is forced to
+    /// INFINITE, a sharable stream using another strategy can't be joined. A joined stream may be non-blocking
     /// (`socket.blocking` false), which [`RunningStream::next_buffer()`]
     /// handles.
     ///
@@ -552,7 +553,8 @@ impl RunningStream {
 
     /// Waits up to a second for the stream's file descriptor to become
     /// readable. Returns `Ok(false)` if the descriptor is hung up, in error
-    /// or invalid, or the wait itself fails, so the caller stops retrying.
+    /// or invalid, or the wait fails other than by being interrupted, so the
+    /// caller stops retrying.
     fn wait_readable(&self) -> std::result::Result<bool, Error> {
         let (fd, maybe_error) = unsafe { try_func!(vdo_sys::vdo_stream_get_fd, self.stream.raw) };
         if fd < 0 {
@@ -567,8 +569,12 @@ impl RunningStream {
         // bounded wait, so a quiet stream returns to vdo_stream_get_buffer
         // regularly rather than parking here.
         let ready = unsafe { glib_sys::g_poll(&mut pfd, 1, 1000) };
+        if ready < 0 {
+            // A signal interrupting the wait is not a broken stream.
+            return Ok(std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted);
+        }
         let broken = (glib_sys::G_IO_HUP | glib_sys::G_IO_ERR | glib_sys::G_IO_NVAL) as u16;
-        Ok(ready >= 0 && pfd.revents & broken == 0)
+        Ok(pfd.revents & broken == 0)
     }
 
     /// The running stream's information (actual resolution, framerate,
