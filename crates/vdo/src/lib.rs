@@ -85,6 +85,7 @@ pub enum Error {
 
 /// Error from the VDO library.
 pub struct VdoError {
+    domain: u32,
     code: i32,
     message: String,
 }
@@ -93,6 +94,7 @@ impl VdoError {
     fn from_gerror(gerror: *mut GError) -> Self {
         if gerror.is_null() {
             return VdoError {
+                domain: 0,
                 code: 0,
                 message: String::new(),
             };
@@ -114,9 +116,17 @@ impl VdoError {
         unsafe { glib_sys::g_error_free(gerror) };
 
         VdoError {
+            domain: g_error.domain,
             code: g_error.code,
             message,
         }
+    }
+
+    /// Whether this is `VDO_ERROR_NO_DATA` from the VDO error domain.
+    fn is_no_data(&self) -> bool {
+        // SAFETY: vdo_error_quark only registers/returns a GQuark.
+        self.domain == unsafe { vdo_sys::vdo_error_quark() }
+            && self.code == vdo_sys::VDO_ERROR_NO_DATA.0 as i32
     }
 
     /// Returns a human-readable name for the VDO error code.
@@ -212,7 +222,6 @@ pub struct StreamBuilder {
     resolution: Resolution,
     framerate: u32,
     gop_length: u32,
-    settings: Option<Map>,
 }
 
 impl Default for StreamBuilder {
@@ -224,7 +233,6 @@ impl Default for StreamBuilder {
             resolution: Resolution::Native,
             framerate: 0,
             gop_length: 0,
-            settings: None,
         }
     }
 }
@@ -232,39 +240,6 @@ impl Default for StreamBuilder {
 impl StreamBuilder {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// A builder that passes exactly `settings` to `vdo_stream_new`; the
-    /// other builder methods have no effect on it.
-    ///
-    /// Use this to join an encode that is already running: when `settings`
-    /// is an exact copy of a stream whose `sharable` setting is true (from
-    /// [`list_streams()`], with the `id`, `identity` and `intent` entries
-    /// removed), VDO gives the new stream the *same* encode instead of
-    /// starting another, and [`Stream::id()`] returns the existing stream's
-    /// id. The copy must be exact, buffer settings included; any difference
-    /// starts a new encode. A joined stream may be non-blocking
-    /// (`socket.blocking` false), which [`RunningStream::next_buffer()`]
-    /// handles.
-    ///
-    /// ```no_run
-    /// let existing = vdo::list_streams()?
-    ///     .into_iter()
-    ///     .find(|s| s.settings.get_bool(c"sharable", false))
-    ///     .expect("a sharable stream");
-    /// let mut settings = existing.settings.clone();
-    /// for key in [c"id", c"identity", c"intent"] {
-    ///     settings.remove(key);
-    /// }
-    /// let stream = vdo::StreamBuilder::from_settings(settings).build()?;
-    /// assert_eq!(stream.id(), existing.id);
-    /// # Ok::<(), vdo::Error>(())
-    /// ```
-    pub fn from_settings(settings: Map) -> Self {
-        Self {
-            settings: Some(settings),
-            ..Self::default()
-        }
     }
 
     /// Default: `VdoFormat::VDO_FORMAT_H264`
@@ -316,9 +291,6 @@ impl StreamBuilder {
     /// Returns an error if the stream could not be created (e.g., invalid format
     /// for the platform, or camera not available).
     pub fn build(self) -> std::result::Result<Stream, Error> {
-        if let Some(map) = self.settings {
-            return Stream::from_settings(&map);
-        }
         let mut map = Map::new();
         map.set_u32(c"channel", self.channel);
         map.set_u32(c"format", self.format.0 as u32);
@@ -340,7 +312,7 @@ impl StreamBuilder {
             VdoBufferStrategy::VDO_BUFFER_STRATEGY_INFINITE.0,
         );
 
-        Stream::from_settings(&map)
+        Stream::create(&map)
     }
 }
 
@@ -426,7 +398,43 @@ impl Stream {
         StreamBuilder::new().build()
     }
 
-    fn from_settings(map: &Map) -> std::result::Result<Self, Error> {
+    /// Creates a stream from exactly `settings`, except that the buffer
+    /// strategy is always INFINITE (the only one this crate supports, as in
+    /// [`StreamBuilder::build()`]).
+    ///
+    /// Use this to join an encode that is already running: when `settings`
+    /// is an exact copy of a stream whose `sharable` setting is true (from
+    /// [`list_streams()`], with the `id`, `identity` and `intent` entries
+    /// removed), VDO gives the new stream the *same* encode instead of
+    /// starting another, and [`Stream::id()`] returns the existing stream's
+    /// id. The copy must be exact, buffer settings included; any difference
+    /// starts a new encode. A joined stream may be non-blocking
+    /// (`socket.blocking` false), which [`RunningStream::next_buffer()`]
+    /// handles.
+    ///
+    /// ```no_run
+    /// let existing = vdo::list_streams()?
+    ///     .into_iter()
+    ///     .find(|s| s.settings.get_bool(c"sharable", false))
+    ///     .expect("a sharable stream");
+    /// let mut settings = existing.settings.clone();
+    /// for key in [c"id", c"identity", c"intent"] {
+    ///     settings.remove(key);
+    /// }
+    /// let stream = vdo::Stream::from_settings(&settings)?;
+    /// assert_eq!(stream.id(), existing.id);
+    /// # Ok::<(), vdo::Error>(())
+    /// ```
+    pub fn from_settings(settings: &Map) -> std::result::Result<Self, Error> {
+        let mut map = settings.clone();
+        map.set_u32(
+            c"buffer.strategy",
+            VdoBufferStrategy::VDO_BUFFER_STRATEGY_INFINITE.0,
+        );
+        Self::create(&map)
+    }
+
+    fn create(map: &Map) -> std::result::Result<Self, Error> {
         let (stream_raw, maybe_error) =
             unsafe { try_func!(vdo_sys::vdo_stream_new, map.as_ptr(), None) };
 
@@ -446,7 +454,7 @@ impl Stream {
     }
 
     /// The stream's VDO id. For a stream that joined an existing encode (see
-    /// [`StreamBuilder::from_settings()`]) this is the existing stream's id.
+    /// [`Stream::from_settings()`]) this is the existing stream's id.
     pub fn id(&self) -> u32 {
         unsafe { vdo_sys::vdo_stream_get_id(self.raw) }
     }
@@ -512,7 +520,8 @@ impl RunningStream {
     ///
     /// A stream that joined an existing encode can be non-blocking, where
     /// VDO reports `VDO_ERROR_NO_DATA` until a frame is ready; this waits on
-    /// the stream's file descriptor and retries, so it blocks either way.
+    /// the stream's file descriptor and retries, so it blocks either way. It
+    /// returns that error if the descriptor is hung up or in error.
     pub fn next_buffer(&self) -> std::result::Result<StreamBuffer<'_>, Error> {
         let buffer_ptr = loop {
             let (buffer_ptr, maybe_error) =
@@ -521,8 +530,10 @@ impl RunningStream {
                 break buffer_ptr;
             }
             match maybe_error {
-                Some(Error::Vdo(e)) if e.code() == vdo_sys::VDO_ERROR_NO_DATA.0 as i32 => {
-                    self.wait_readable()?
+                Some(Error::Vdo(e)) if e.is_no_data() => {
+                    if !self.wait_readable()? {
+                        return Err(Error::Vdo(e));
+                    }
                 }
                 other => return Err(other.unwrap_or(Error::MissingVdoError)),
             }
@@ -539,8 +550,10 @@ impl RunningStream {
         self.stream.id()
     }
 
-    /// Blocks until the stream's file descriptor is readable.
-    fn wait_readable(&self) -> std::result::Result<(), Error> {
+    /// Waits up to a second for the stream's file descriptor to become
+    /// readable. Returns `Ok(false)` if the descriptor is hung up, in error
+    /// or invalid, or the wait itself fails, so the caller stops retrying.
+    fn wait_readable(&self) -> std::result::Result<bool, Error> {
         let (fd, maybe_error) = unsafe { try_func!(vdo_sys::vdo_stream_get_fd, self.stream.raw) };
         if fd < 0 {
             return Err(maybe_error.unwrap_or(Error::MissingVdoError));
@@ -550,10 +563,23 @@ impl RunningStream {
             events: glib_sys::G_IO_IN as u16,
             revents: 0,
         };
-        // A bounded wait, so a stream that has stopped producing returns to
-        // vdo_stream_get_buffer (and its error) instead of hanging here.
-        unsafe { glib_sys::g_poll(&mut pfd, 1, 1000) };
-        Ok(())
+        // SAFETY: pfd is a valid GPollFD for the duration of the call. A
+        // bounded wait, so a quiet stream returns to vdo_stream_get_buffer
+        // regularly rather than parking here.
+        let ready = unsafe { glib_sys::g_poll(&mut pfd, 1, 1000) };
+        let broken = (glib_sys::G_IO_HUP | glib_sys::G_IO_ERR | glib_sys::G_IO_NVAL) as u16;
+        Ok(ready >= 0 && pfd.revents & broken == 0)
+    }
+
+    /// The running stream's information (actual resolution, framerate,
+    /// `peers`, statistics, …); see [`Stream::info()`].
+    pub fn info(&self) -> std::result::Result<Map, Error> {
+        self.stream.info()
+    }
+
+    /// The running stream's settings; see [`Stream::settings()`].
+    pub fn settings(&self) -> std::result::Result<Map, Error> {
+        self.stream.settings()
     }
 
     /// Asks the encoder to insert a key frame into the stream.
@@ -728,18 +754,21 @@ mod unit_tests {
     #[test]
     fn error_code_names() {
         let err = VdoError {
+            domain: 0,
             code: vdo_sys::VDO_ERROR_NOT_FOUND.0 as i32,
             message: "test".to_string(),
         };
         expect!["VDO_ERROR_NOT_FOUND"].assert_eq(err.code_name());
 
         let err = VdoError {
+            domain: 0,
             code: vdo_sys::VDO_ERROR_NOT_SUPPORTED.0 as i32,
             message: "test".to_string(),
         };
         expect!["VDO_ERROR_NOT_SUPPORTED"].assert_eq(err.code_name());
 
         let err = VdoError {
+            domain: 0,
             code: 9999,
             message: "test".to_string(),
         };
@@ -748,6 +777,7 @@ mod unit_tests {
         // Negative codes (from non-VDO GError domains) should map to UNKNOWN,
         // not wrap to a matching VDO constant.
         let err = VdoError {
+            domain: 0,
             code: -1,
             message: "test".to_string(),
         };
@@ -755,8 +785,24 @@ mod unit_tests {
     }
 
     #[test]
+    fn no_data_requires_the_vdo_error_domain() {
+        let foreign = VdoError {
+            domain: 0,
+            code: vdo_sys::VDO_ERROR_NO_DATA.0 as i32,
+            message: "test".to_string(),
+        };
+        assert!(!foreign.is_no_data());
+        let vdo = VdoError {
+            domain: unsafe { vdo_sys::vdo_error_quark() },
+            ..foreign
+        };
+        assert!(vdo.is_no_data());
+    }
+
+    #[test]
     fn error_display() {
         let err = VdoError {
+            domain: 0,
             code: vdo_sys::VDO_ERROR_BUSY.0 as i32,
             message: "Resource is busy".to_string(),
         };
@@ -813,6 +859,7 @@ mod unit_tests {
     #[test]
     fn error_from_vdo_error() {
         let vdo_err = VdoError {
+            domain: 0,
             code: 1,
             message: "test".to_string(),
         };
@@ -833,6 +880,7 @@ mod unit_tests {
         expect!["Missing error data from VDO library"]
             .assert_eq(&format!("{}", Error::MissingVdoError));
         let vdo = Error::Vdo(VdoError {
+            domain: 0,
             code: 1,
             message: "test".to_string(),
         });
