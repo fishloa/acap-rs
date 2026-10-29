@@ -52,7 +52,8 @@ pub fn build_and_pack(
         Ok(())
     })?;
 
-    let cargo_target_directory = get_cargo_metadata(manifest_path)?.target_directory;
+    let metadata = get_cargo_metadata(manifest_path)?;
+    let cargo_target_directory = metadata.target_directory.clone();
     let mut out_dirs = HashMap::new();
     let mut artifacts = Vec::new();
     for m in messages {
@@ -77,6 +78,7 @@ pub fn build_and_pack(
                             manifest_path,
                             executable,
                             out_dir,
+                            &metadata.workspace_root,
                         )?,
                         name,
                     });
@@ -113,6 +115,7 @@ fn pack(
     manifest_path: PathBuf,
     executable: PathBuf,
     out_dir: Option<PathBuf>,
+    workspace_root: &Path,
 ) -> anyhow::Result<PathBuf> {
     let mut staging_dir = cargo_target_dir.join(arch.nickname());
     if !staging_dir.is_dir() {
@@ -148,7 +151,7 @@ fn pack(
         } else if name == "LICENSE" {
             let cache_dir = cargo_target_dir.join("cargo-acap-sdk").join("LICENSE");
             std::fs::create_dir_all(&cache_dir)?;
-            let path = license::generate(&manifest_path, &cache_dir)?;
+            let path = license::generate(&manifest_path, &cache_dir, workspace_root)?;
             app_builder.add_as(&path, "LICENSE")?;
         } else {
             bail!("Found no {name} to copy and don't know how to generate one")
