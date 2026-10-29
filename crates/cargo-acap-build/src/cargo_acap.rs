@@ -10,7 +10,10 @@ use anyhow::{bail, Context};
 use log::{debug, error, warn};
 
 use crate::{
-    cargo::{cargo_command, get_cargo_metadata, json_message, json_message::JsonMessage},
+    cargo::{
+        cargo_command, get_cargo_metadata, json_message, json_message::JsonMessage,
+        metadata::CargoMetadata,
+    },
     command_utils::RunWith,
     files::license,
 };
@@ -53,7 +56,6 @@ pub fn build_and_pack(
     })?;
 
     let metadata = get_cargo_metadata(manifest_path)?;
-    let cargo_target_directory = metadata.target_directory.clone();
     let mut out_dirs = HashMap::new();
     let mut artifacts = Vec::new();
     for m in messages {
@@ -72,14 +74,7 @@ pub fn build_and_pack(
                 if is_app(&manifest_path, out_dir.as_deref()) {
                     // If the executable should be an ACAP app, create an `.eap` file.
                     artifacts.push(Artifact::Eap {
-                        path: pack(
-                            &cargo_target_directory,
-                            target.into(),
-                            manifest_path,
-                            executable,
-                            out_dir,
-                            &metadata.workspace_root,
-                        )?,
+                        path: pack(&metadata, target.into(), manifest_path, executable, out_dir)?,
                         name,
                     });
                 } else {
@@ -110,13 +105,13 @@ pub fn build_and_pack(
 }
 
 fn pack(
-    cargo_target_dir: &Path,
+    metadata: &CargoMetadata,
     arch: Architecture,
     manifest_path: PathBuf,
     executable: PathBuf,
     out_dir: Option<PathBuf>,
-    workspace_root: &Path,
 ) -> anyhow::Result<PathBuf> {
+    let cargo_target_dir = &metadata.target_directory;
     let mut staging_dir = cargo_target_dir.join(arch.nickname());
     if !staging_dir.is_dir() {
         std::fs::create_dir(&staging_dir)?;
@@ -151,7 +146,7 @@ fn pack(
         } else if name == "LICENSE" {
             let cache_dir = cargo_target_dir.join("cargo-acap-sdk").join("LICENSE");
             std::fs::create_dir_all(&cache_dir)?;
-            let path = license::generate(&manifest_path, &cache_dir, workspace_root)?;
+            let path = license::generate(&manifest_path, &cache_dir, &metadata.workspace_root)?;
             app_builder.add_as(&path, "LICENSE")?;
         } else {
             bail!("Found no {name} to copy and don't know how to generate one")
