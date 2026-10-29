@@ -11,27 +11,21 @@ use serde_json::json;
 
 use crate::ajr_http;
 
-fn deserialize_duration<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value: Option<String> = Option::deserialize(deserializer)?;
-    match value {
-        None => Ok(None),
-        Some(text) => text
-            .parse::<u64>()
-            .map(|seconds| Some(Duration::from_secs(seconds)))
-            .map_err(serde::de::Error::custom),
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+struct Seconds(Duration);
+
+impl TryFrom<String> for Seconds {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Ok(Self(Duration::from_secs(value.parse()?)))
     }
 }
 
-fn serialize_duration<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    match value {
-        None => serializer.serialize_none(),
-        Some(duration) => serializer.serialize_str(&duration.as_secs().to_string()),
+impl From<Seconds> for String {
+    fn from(value: Seconds) -> Self {
+        value.0.as_secs().to_string()
     }
 }
 
@@ -47,19 +41,9 @@ enum Data {
 pub struct SystemreadyData {
     systemready: EnglishBool,
     needsetup: EnglishBool,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
-    uptime: Option<Duration>,
+    uptime: Option<Seconds>,
     bootid: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_duration",
-        serialize_with = "serialize_duration"
-    )]
-    previewmode: Option<Duration>,
+    previewmode: Option<Seconds>,
 }
 
 impl SystemreadyData {
@@ -75,7 +59,7 @@ impl SystemreadyData {
 
     /// Elapsed since device started?
     pub fn uptime(&self) -> Option<Duration> {
-        self.uptime
+        self.uptime.map(|s| s.0)
     }
 
     // A unique id generated at each boot?
@@ -85,7 +69,7 @@ impl SystemreadyData {
 
     /// Total or remaining?
     pub fn preview_mode(&self) -> Option<Duration> {
-        self.previewmode
+        self.previewmode.map(|s| s.0)
     }
 }
 
