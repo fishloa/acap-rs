@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn preview_mode_returns_previewmode_not_uptime() {
-        let text = r#"{"apiVersion":"1.4","method":"systemready","data":{"systemready":"no","needsetup":"yes","uptime":"65","previewmode":"7200"}}"#;
+        let text = include_str!("systemready/11_11_initial_response.json");
         let envelope: ResponseEnvelope<Data> = serde_json::from_str(text).unwrap();
         let Data::Systemready(data) = envelope.data().unwrap();
         assert_eq!(data.preview_mode(), Some(Duration::from_secs(7200)));
